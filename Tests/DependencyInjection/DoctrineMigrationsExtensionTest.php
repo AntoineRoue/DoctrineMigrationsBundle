@@ -4,20 +4,19 @@ declare(strict_types=1);
 
 namespace Doctrine\Bundle\MigrationsBundle\Tests\DependencyInjection;
 
+use Doctrine\Bundle\DoctrineBundle\DependencyInjection\DoctrineExtension;
+use Doctrine\Bundle\DoctrineBundle\Registry;
 use Doctrine\Bundle\MigrationsBundle\DependencyInjection\DoctrineMigrationsExtension;
 use Doctrine\Bundle\MigrationsBundle\DoctrineMigrationsBundle;
-use Doctrine\Bundle\MigrationsBundle\Tests\Fixtures\CustomEntityManager;
 use Doctrine\Bundle\MigrationsBundle\Tests\Fixtures\Migrations\Migration001;
 use Doctrine\Bundle\MigrationsBundle\Tests\Fixtures\TestBundle\TestBundle;
-use Doctrine\DBAL\Connection;
 use Doctrine\Migrations\Configuration\Configuration;
 use Doctrine\Migrations\DependencyFactory;
+use Doctrine\Migrations\Exception\MissingDependency;
 use Doctrine\Migrations\Metadata\Storage\MetadataStorage;
 use Doctrine\Migrations\Metadata\Storage\TableMetadataStorageConfiguration;
 use Doctrine\Migrations\Version\Comparator;
 use Doctrine\Migrations\Version\Version;
-use Doctrine\ORM\EntityManager;
-use Doctrine\Persistence\ManagerRegistry;
 use Exception;
 use InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
@@ -31,7 +30,6 @@ use Symfony\Component\DependencyInjection\ParameterBag\ParameterBag;
 use Symfony\Component\DependencyInjection\Reference;
 
 use function assert;
-use function method_exists;
 use function sys_get_temp_dir;
 
 class DoctrineMigrationsExtensionTest extends TestCase
@@ -39,9 +37,6 @@ class DoctrineMigrationsExtensionTest extends TestCase
     public function testXmlConfigs(): void
     {
         $container = $this->getContainerBuilder();
-
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.default_connection', $conn);
 
         $container->registerExtension(new DoctrineMigrationsExtension());
 
@@ -83,9 +78,6 @@ class DoctrineMigrationsExtensionTest extends TestCase
         ];
         $container = $this->getContainer($config);
 
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.default_connection', $conn);
-
         $container->compile();
 
         $config = $container->get('doctrine.migrations.configuration');
@@ -97,8 +89,6 @@ class DoctrineMigrationsExtensionTest extends TestCase
     {
         $container = $this->getContainer([]);
 
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.default_connection', $conn);
         $container->compile();
 
         $config = $container->get('doctrine.migrations.configuration');
@@ -116,8 +106,6 @@ class DoctrineMigrationsExtensionTest extends TestCase
             ],
         ]);
 
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.default_connection', $conn);
         $container->compile();
 
         $config = $container->get('doctrine.migrations.configuration');
@@ -163,9 +151,6 @@ class DoctrineMigrationsExtensionTest extends TestCase
         ];
         $container = $this->getContainer($config);
 
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.default_connection', $conn);
-
         $sorter = new class () implements Comparator{
             public function compare(Version $a, Version $b): int
             {
@@ -188,9 +173,6 @@ class DoctrineMigrationsExtensionTest extends TestCase
         ];
         $container = $this->getContainer($config);
 
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.default_connection', $conn);
-
         $container->compile();
 
         $di = $container->get('doctrine.migrations.dependency_factory');
@@ -208,9 +190,6 @@ class DoctrineMigrationsExtensionTest extends TestCase
             'services' => [Comparator::class => 'my_sorter'],
         ];
         $container = $this->getContainer($config);
-
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.default_connection', $conn);
 
         $sorterFactory = new class () {
             public function __invoke(): void
@@ -238,9 +217,6 @@ class DoctrineMigrationsExtensionTest extends TestCase
         ];
 
         $container = $this->getContainer($config);
-
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.default_connection', $conn);
 
         $sorterFactory = new class ($mockComparator) {
             /** @var Comparator */
@@ -271,16 +247,20 @@ class DoctrineMigrationsExtensionTest extends TestCase
             'migrations_paths' => ['DoctrineMigrationsTest' => 'a'],
             'connection' => 'custom',
         ];
-        $container = $this->getContainer($config);
-
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.custom_connection', $conn);
+        $container = $this->getContainer($config, [
+            'connections' => [
+                'custom' => ['url' => 'sqlite:///:memory:'],
+                'another' => ['url' => 'sqlite:///:memory:'],
+            ],
+        ]);
 
         $container->compile();
+        $doctrine = $container->get('doctrine');
+        assert($doctrine instanceof Registry);
 
         $di = $container->get('doctrine.migrations.dependency_factory');
         self::assertInstanceOf(DependencyFactory::class, $di);
-        self::assertSame($conn, $di->getConnection());
+        self::assertSame($doctrine->getConnection('custom'), $di->getConnection());
     }
 
     public function testPrefersEntityManagerOverConnection(): void
@@ -288,79 +268,35 @@ class DoctrineMigrationsExtensionTest extends TestCase
         $config    = [
             'migrations_paths' => ['DoctrineMigrationsTest' => 'a'],
         ];
-        $container = $this->getContainer($config);
-
-        $em = $this->createMock(EntityManager::class);
-        $container->set('doctrine.orm.default_entity_manager', $em);
+        $container = $this->getContainer($config, null, []);
 
         $container->compile();
 
         $di = $container->get('doctrine.migrations.dependency_factory');
 
         self::assertInstanceOf(DependencyFactory::class, $di);
-        self::assertSame($em, $di->getEntityManager());
+        $di->getEntityManager();
     }
 
-    /**
-     * @return array<array{string|null}>
-     */
-    public function getEmNames(): array
+    public function testNoEntityManagersConfigured(): void
     {
-        return [
-            [null],
-            ['custom'],
-        ];
-    }
-
-    /**
-     * @dataProvider getEmNames
-     */
-    public function testPrefersManagerRegistry(?string $emName): void
-    {
-        $config    = ['em' => $emName];
+        $config    = ['em' => null];
         $container = $this->getContainer($config);
-
-        $em           = $this->createMock(EntityManager::class);
-        $registryMock = $this->createMock(ManagerRegistry::class);
-
-        $registryMock->expects(self::once())
-            ->method('getManager')
-            ->with($emName)
-            ->willReturn($em);
-
-        $container->set('doctrine', $registryMock);
 
         $container->compile();
 
         $di = $container->get('doctrine.migrations.dependency_factory');
-
         self::assertInstanceOf(DependencyFactory::class, $di);
-        self::assertSame($em, $di->getEntityManager());
+
+        $this->expectException(MissingDependency::class);
+        $di->getEntityManager();
     }
 
     public function testManagerRegistryThrowsExceptionOnUnknownEm(): void
     {
-        $config    = ['em' => 'foo'];
-        $container = $this->getContainer($config);
-
-        $em           = $this->createMock(EntityManager::class);
-        $registryMock = $this->createMock(ManagerRegistry::class);
-
-        $registryMock->expects(self::once())
-            ->method('getManager')
-            ->with('foo')
-            ->willThrowException(new InvalidArgumentException());
-
-        $container->set('doctrine', $registryMock);
-
-        $container->compile();
-
-        $di = $container->get('doctrine.migrations.dependency_factory');
-
-        self::assertInstanceOf(DependencyFactory::class, $di);
-
+        $container = $this->getContainer(['em' => 'foo']);
         $this->expectException(InvalidArgumentException::class);
-        self::assertSame($em, $di->getEntityManager());
+        $container->compile();
     }
 
     public function testCustomEntityManager(): void
@@ -369,22 +305,22 @@ class DoctrineMigrationsExtensionTest extends TestCase
             'em' => 'custom',
             'migrations_paths' => ['DoctrineMigrationsTest' => 'a'],
         ];
-        $container = $this->getContainer($config);
-
-        $em = new Definition(CustomEntityManager::class);
-        $container->setDefinition('doctrine.orm.custom_entity_manager', $em);
+        $container = $this->getContainer($config, null, [
+            'entity_managers' => [
+                'custom' => null,
+                'acb' => null,
+            ],
+        ]);
 
         $container->compile();
 
         $di = $container->get('doctrine.migrations.dependency_factory');
         self::assertInstanceOf(DependencyFactory::class, $di);
-
+        $doctrine = $container->get('doctrine');
+        assert($doctrine instanceof Registry);
         $em = $di->getEntityManager();
-        self::assertInstanceOf(CustomEntityManager::class, $em);
 
-        assert(method_exists($di->getConnection(), 'getEm'));
-        self::assertInstanceOf(CustomEntityManager::class, $di->getConnection()->getEm());
-        self::assertSame($em, $di->getConnection()->getEm());
+        self::assertSame($doctrine->getManager('custom'), $em);
     }
 
     public function testCustomMetadataStorage(): void
@@ -398,9 +334,6 @@ class DoctrineMigrationsExtensionTest extends TestCase
 
         $mockStorage = $this->createMock(MetadataStorage::class);
         $container->set('mock_storage_service', $mockStorage);
-
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.default_connection', $conn);
 
         $container->compile();
 
@@ -419,10 +352,6 @@ class DoctrineMigrationsExtensionTest extends TestCase
             'services' => ['foo' => 'mock_storage_service'],
         ];
         $container = $this->getContainer($config);
-
-        $conn = $this->createMock(Connection::class);
-        $container->set('doctrine.dbal.default_connection', $conn);
-
         $container->compile();
     }
 
@@ -443,9 +372,11 @@ class DoctrineMigrationsExtensionTest extends TestCase
     }
 
     /**
-     * @param mixed[] $config
+     * @param mixed[]      $config
+     * @param mixed[]|null $dbalConfig
+     * @param mixed[]|null $ormConfig
      */
-    private function getContainer(array $config): ContainerBuilder
+    private function getContainer(array $config, ?array $dbalConfig = null, ?array $ormConfig = null): ContainerBuilder
     {
         $container = $this->getContainerBuilder();
 
@@ -453,8 +384,16 @@ class DoctrineMigrationsExtensionTest extends TestCase
         $bundle->build($container);
 
         $extension = new DoctrineMigrationsExtension();
-
         $extension->load(['doctrine_migrations' => $config], $container);
+
+        $extension = new DoctrineExtension();
+
+        $doctrineBundleConfigs = $dbalConfig === null ? ['dbal' => ['url' => 'sqlite:///:memory:']] : ['dbal' => $dbalConfig];
+        if ($ormConfig !== null) {
+            $doctrineBundleConfigs += ['orm' => $ormConfig];
+        }
+
+        $extension->load(['doctrine' => $doctrineBundleConfigs], $container);
 
         $container->getDefinition('doctrine.migrations.dependency_factory')->setPublic(true);
         $container->getDefinition('doctrine.migrations.configuration')->setPublic(true);
